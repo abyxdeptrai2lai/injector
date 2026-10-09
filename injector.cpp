@@ -37,17 +37,50 @@ std::vector<DiscordFlavor> GetFlavors() {
     };
 }
 
-struct ProcInfo { DWORD pid; std::wstring name; };
+struct ProcInfo {
+    DWORD pid;
+    std::wstring name;
+    std::wstring fullPath;
+};
 
-std::vector<ProcInfo> FindProcessesByName(const std::wstring& procName) {
+bool IsProcessRunning(DWORD pid) {
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return false;
+    DWORD exitCode = 0;
+    BOOL ok = GetExitCodeProcess(h, &exitCode);
+    CloseHandle(h);
+    return ok && exitCode == STILL_ACTIVE;
+}
+
+std::wstring GetProcessPath(DWORD pid) {
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return L"";
+    wchar_t buf[MAX_PATH * 2]{};
+    DWORD size = sizeof(buf) / sizeof(wchar_t);
+    std::wstring result;
+    if (QueryFullProcessImageNameW(h, 0, buf, &size)) {
+        result = buf;
+    }
+    CloseHandle(h);
+    return result;
+}
+
+std::vector<ProcInfo> FindRunningDiscords() {
     std::vector<ProcInfo> result;
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnap == INVALID_HANDLE_VALUE) return result;
     PROCESSENTRY32W pe{}; pe.dwSize = sizeof(pe);
     if (Process32FirstW(hSnap, &pe)) {
         do {
-            if (_wcsicmp(pe.szExeFile, procName.c_str()) == 0)
-                result.push_back({ pe.th32ProcessID, pe.szExeFile });
+            for (auto& f : g_flavors) {
+                if (_wcsicmp(pe.szExeFile, f.procName.c_str()) == 0) {
+                    ProcInfo info;
+                    info.pid = pe.th32ProcessID;
+                    info.name = pe.szExeFile;
+                    info.fullPath = GetProcessPath(pe.th32ProcessID);
+                    result.push_back(info);
+                }
+            }
         } while (Process32NextW(hSnap, &pe));
     }
     CloseHandle(hSnap);
@@ -109,8 +142,21 @@ std::vector<fs::path> ScanDllsNextToExe() {
     return dlls;
 }
 
+bool HasModuleFiles(const fs::path& dir) {
+    try {
+        for (auto& f : fs::directory_iterator(dir)) {
+            if (!f.is_regular_file()) continue;
+            auto ext = f.path().extension().wstring();
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
+            if (ext == L".node" || ext == L".dll") return true;
+        }
+    } catch (...) {}
+    return false;
+}
+
 fs::path FindDiscordVoiceFolder(const std::wstring& discordRoot) {
     if (!fs::exists(discordRoot)) return {};
+
     std::vector<fs::path> apps;
     for (auto& e : fs::directory_iterator(discordRoot)) {
         if (!e.is_directory()) continue;
@@ -119,8 +165,37 @@ fs::path FindDiscordVoiceFolder(const std::wstring& discordRoot) {
     }
     if (apps.empty()) return {};
     std::sort(apps.begin(), apps.end());
-    fs::path voice = apps.back() / L"modules" / L"discord_voice";
-    if (fs::exists(voice) && fs::is_directory(voice)) return voice;
+
+    for (auto it = apps.rbegin(); it != apps.rend(); ++it) {
+        fs::path modulesDir = *it / L"modules";
+        if (!fs::exists(modulesDir) || !fs::is_directory(modulesDir)) continue;
+
+        std::vector<fs::path> voiceDirs;
+        for (auto& e : fs::directory_iterator(modulesDir)) {
+            if (!e.is_directory()) continue;
+            std::wstring n = e.path().filename().wstring();
+            if (n.rfind(L"discord_voice", 0) == 0) {
+                voiceDirs.push_back(e.path());
+            }
+        }
+        if (voiceDirs.empty()) continue;
+        std::sort(voiceDirs.begin(), voiceDirs.end());
+
+        for (auto vit = voiceDirs.rbegin(); vit != voiceDirs.rend(); ++vit) {
+            fs::path outer = *vit;
+
+            fs::path inner = outer / L"discord_voice";
+            if (fs::exists(inner) && fs::is_directory(inner)) {
+                if (HasModuleFiles(inner) || fs::is_empty(inner)) {
+                    return inner;
+                }
+            }
+
+            if (HasModuleFiles(outer)) {
+                return outer;
+            }
+        }
+    }
     return {};
 }
 
@@ -411,6 +486,23 @@ std::vector<int> ParseIndexList(const std::wstring& line, size_t maxN) {
     return out;
 }
 
+bool IsAllKeyword(const std::wstring& line) {
+    std::wstring t = line;
+    while (!t.empty() && iswspace(t.front())) t.erase(t.begin());
+    while (!t.empty() && iswspace(t.back()))  t.pop_back();
+    std::transform(t.begin(), t.end(), t.begin(), ::towlower);
+    return t == L"all";
+}
+
+std::wstring TrimQuotes(const std::wstring& s) {
+    std::wstring t = s;
+    while (!t.empty() && iswspace(t.front())) t.erase(t.begin());
+    while (!t.empty() && iswspace(t.back()))  t.pop_back();
+    if (t.size() >= 2 && t.front() == L'"' && t.back() == L'"')
+        t = t.substr(1, t.size() - 2);
+    return t;
+}
+
 void CleanupAndExit(int code) {
     if (g_exiting) return;
     g_exiting = true;
@@ -453,6 +545,7 @@ DWORD WINAPI InjectLoop(LPVOID) {
         }
         for (DWORD pid : pids) {
             if (!g_running) break;
+            if (!IsProcessRunning(pid)) continue;
             for (auto& dll : g_injectDlls) {
                 if (!g_running) break;
                 std::string ansi = dll.string();
@@ -477,17 +570,57 @@ int wmain() {
 
     std::wcout << L"=== Discord Module Tool ===\n\n";
 
-    // ---------- BƯỚC 1: CHỌN DISCORD TRƯỚC ----------
-    std::wcout << L"[1] Chon Discord:\n";
-    for (size_t i = 0; i < g_flavors.size(); i++) {
-        DWORD pid = FindProcessByName(g_flavors[i].procName);
-        bool installed = fs::exists(g_flavors[i].localDir);
-        std::wcout << L"    " << (i + 1) << L". " << g_flavors[i].name;
-        if (pid) std::wcout << L"  [DANG CHAY - PID: " << pid << L"]";
-        else if (installed) std::wcout << L"  [da cai, khong chay]";
-        else std::wcout << L"  [chua cai]";
-        std::wcout << L"\n";
+    auto running = FindRunningDiscords();
+    std::vector<ProcInfo> toKill;
+    if (!running.empty()) {
+        std::wcout << L"[1] Discord dang chay:\n";
+        for (size_t i = 0; i < running.size(); i++) {
+            std::wcout << L"    " << (i + 1) << L". " << running[i].name
+                       << L"  (PID: " << running[i].pid << L")";
+            if (!running[i].fullPath.empty())
+                std::wcout << L"\n        Path: " << running[i].fullPath;
+            std::wcout << L"\n";
+        }
+        std::wcout << L"    Nhap so TT muon TAT (vd: 1 hoac 1,2). Go 'all' de tat het. Bo trong = khong tat: ";
+        std::wstring line; std::getline(std::wcin, line);
+
+        if (IsAllKeyword(line)) {
+            toKill = running;
+            std::wcout << L"[+] Chon TAT HET " << running.size() << L" process.\n";
+        } else {
+            auto idxs = ParseIndexList(line, running.size());
+            for (int i : idxs) toKill.push_back(running[i]);
+        }
+    } else {
+        std::wcout << L"[1] Khong co Discord nao dang chay.\n";
     }
+
+    for (auto& p : toKill) {
+        if (IsProcessRunning(p.pid)) {
+            if (KillPid(p.pid)) {
+                Sleep(100);
+                bool stillAlive = IsProcessRunning(p.pid);
+                if (!stillAlive) {
+                    std::wcout << L"[+] Killed " << p.name
+                               << L" (PID: " << p.pid << L")\n";
+                } else {
+                    std::wcout << L"[!] Kill request sent nhung process van chay: "
+                               << p.name << L" (PID: " << p.pid << L")\n";
+                }
+            } else {
+                std::wcout << L"[!] Kill that bai: " << p.name
+                           << L" (PID: " << p.pid << L")\n";
+            }
+        } else {
+            std::wcout << L"[i] Process da tat truoc do: " << p.name
+                       << L" (PID: " << p.pid << L")\n";
+        }
+    }
+    if (!toKill.empty()) Sleep(1500);
+
+    std::wcout << L"\n[2] Thay module discord_voice cho Discord nao?\n";
+    for (size_t i = 0; i < g_flavors.size(); i++)
+        std::wcout << L"    " << (i + 1) << L". " << g_flavors[i].name << L"\n";
     std::wcout << L"    Chon (1-" << g_flavors.size() << L"): ";
 
     std::wstring fLine; std::getline(std::wcin, fLine);
@@ -505,37 +638,56 @@ int wmain() {
     fs::path toolDir = fs::path(exePath).parent_path();
     fs::path moduleDir = toolDir / L"module";
 
-    // ---------- BƯỚC 2: SAU KHI CHỌN -> MỚI TẮT ----------
-    auto procs = FindProcessesByName(flavor.procName);
-    if (!procs.empty()) {
-        std::wcout << L"\n[2] " << flavor.procName << " dang chay:\n";
-        for (size_t i = 0; i < procs.size(); i++)
-            std::wcout << L"    " << (i + 1) << L". " << procs[i].name
-                       << L"  (PID: " << procs[i].pid << L")\n";
-        std::wcout << L"    Nhap so TT muon TAT (vd: 1 hoac 1,2). Bo trong = khong tat: ";
-        std::wstring line; std::getline(std::wcin, line);
-        auto idxs = ParseIndexList(line, procs.size());
-        for (int i : idxs) {
-            if (KillPid(procs[i].pid))
-                std::wcout << L"[+] Killed " << procs[i].name
-                           << L" (PID: " << procs[i].pid << L")\n";
+    fs::path voiceDir;
+    bool foundVoice = false;
+
+    std::wcout << L"\n[3] Tim discord_voice cho " << flavor.name << L"?\n";
+    std::wcout << L"    (y = tu tim, n = tu nhap duong dan): ";
+
+    std::wstring mode;
+    std::getline(std::wcin, mode);
+
+    if (!mode.empty() && (mode[0] == L'n' || mode[0] == L'N')) {
+        std::wcout << L"Nhap duong dan discord_voice: ";
+        std::wstring inputPath;
+        std::getline(std::wcin, inputPath);
+        inputPath = TrimQuotes(inputPath);
+        voiceDir = fs::path(inputPath);
+
+        if (!fs::exists(voiceDir) || !fs::is_directory(voiceDir)) {
+            std::wcout << L"[!] Duong dan khong ton tai hoac khong phai folder.\n";
+            std::wcout << L"Nhan Enter..."; std::wcin.get();
+            return 1;
         }
-        if (!idxs.empty()) Sleep(1500);
+        foundVoice = true;
     } else {
-        std::wcout << L"\n[2] " << flavor.procName << L" khong chay.\n";
+        std::wcout << L"\n[*] Dang tim discord_voice...\n";
+        std::wcout << L"    Go 'stop' + Enter bat cu luc nao de dung va nhap tay.\n\n";
+
+        int attempt = 0;
+        while (!foundVoice && !g_exiting) {
+            attempt++;
+            voiceDir = FindDiscordVoiceFolder(flavor.localDir);
+
+            if (!voiceDir.empty() && fs::exists(voiceDir) && fs::is_directory(voiceDir)) {
+                std::wcout << L"    [lan " << attempt << L"] Tim thay!\n";
+                foundVoice = true;
+                break;
+            }
+
+            std::wcout << L"    [lan " << attempt << L"] Chua thay, thu lai sau 2s...\n";
+            Sleep(2000);
+        }
+
+        if (!foundVoice) {
+            std::wcout << L"[!] Da dung tim. Thoat.\n";
+            std::wcout << L"Nhan Enter..."; std::wcin.get();
+            return 1;
+        }
     }
 
-    // ---------- BƯỚC 3: TÌM discord_voice ----------
-    fs::path voiceDir = FindDiscordVoiceFolder(flavor.localDir);
-    if (voiceDir.empty()) {
-        std::wcout << L"[!] Khong tim thay discord_voice trong: "
-                   << flavor.localDir << L"\n";
-        std::wcout << L"Nhan Enter..."; std::wcin.get();
-        return 1;
-    }
-    std::wcout << L"    discord_voice: " << voiceDir.wstring() << L"\n";
+    std::wcout << L"[+] discord_voice: " << voiceDir.wstring() << L"\n";
 
-    // ---------- BƯỚC 4: RESTORE TRƯỚC KHI THAY ----------
     fs::path restorePath;
     if (PromptRestoreMenu(toolDir, restorePath)) {
         std::wcout << L"\n[*] Restore tu: " << restorePath.wstring() << L"\n";
@@ -554,7 +706,6 @@ int wmain() {
         }
     }
 
-    // ---------- BƯỚC 5: THAY MODULE ----------
     std::wcout << L"\n";
     if (!ReplaceModule(moduleDir, voiceDir, toolDir)) {
         std::wcout << L"[!] Thay module that bai.\n";
@@ -562,7 +713,6 @@ int wmain() {
         return 1;
     }
 
-    // ---------- BƯỚC 6: RESTORE SAU KHI THAY ----------
     fs::path restorePath2;
     if (PromptRestoreMenu(toolDir, restorePath2)) {
         std::wcout << L"\n[*] Restore tu: " << restorePath2.wstring() << L"\n";
@@ -573,16 +723,15 @@ int wmain() {
         }
     }
 
-    // ---------- BƯỚC 7: CHỌN DLL INJECT ----------
     auto dlls = ScanDllsNextToExe();
     if (dlls.empty()) {
-        std::wcout << L"\n[7] [!] Khong co DLL nao canh tool.\n";
+        std::wcout << L"\n[4] [!] Khong co DLL nao canh tool.\n";
         MessageBoxW(nullptr, L"No DLL found.", L"Tool", MB_OK | MB_ICONERROR);
         std::wcout << L"Nhan Enter..."; std::wcin.get();
         return 1;
     }
 
-    std::wcout << L"\n[7] DLL canh tool (INJECT lien tuc):\n";
+    std::wcout << L"\n[4] DLL canh tool (INJECT lien tuc):\n";
     for (size_t i = 0; i < dlls.size(); i++)
         std::wcout << L"    " << (i + 1) << L". " << dlls[i].filename().wstring()
                    << L"  (" << fs::file_size(dlls[i]) << L" bytes)\n";
@@ -602,8 +751,7 @@ int wmain() {
     for (auto& d : g_injectDlls)
         std::wcout << L"        - " << d.filename().wstring() << L"\n";
 
-    // ---------- BƯỚC 8: XÁC NHẬN MỞ ----------
-    std::wcout << L"\n[8] Mo " << flavor.name << L"? (Enter = dong y, n = huy): ";
+    std::wcout << L"\n[5] Mo " << flavor.name << L"? (Enter = dong y, n = huy): ";
     std::wstring confirm; std::getline(std::wcin, confirm);
     if (!confirm.empty() && (confirm[0] == L'n' || confirm[0] == L'N')) {
         std::wcout << L"[!] Huy.\n";
@@ -611,7 +759,6 @@ int wmain() {
         return 0;
     }
 
-    // ---------- BƯỚC 9: MỞ DISCORD ----------
     std::wcout << L"\n[*] Dang mo " << flavor.name << L"...\n";
     g_launchedPid = LaunchDiscord(flavor.localDir, flavor.procName);
     g_launchedProcName = flavor.procName;
@@ -627,8 +774,7 @@ int wmain() {
     std::wcout << L"[+] Launched (PID: " << g_launchedPid << L")\n";
     Sleep(3000);
 
-    // ---------- BƯỚC 10: INJECT LIÊN TỤC ----------
-    std::wcout << L"\n[9] Bat dau inject lien tuc (moi ~3s).\n";
+    std::wcout << L"\n[6] Bat dau inject lien tuc (moi ~3s).\n";
     std::wcout << L"    DONG CMD / Ctrl+C / Enter de DUNG + TAT Discord.\n\n";
 
     HANDLE hThread = CreateThread(nullptr, 0, InjectLoop, nullptr, 0, nullptr);
